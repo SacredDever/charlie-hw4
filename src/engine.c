@@ -1,321 +1,431 @@
-// engine.c — resilient engine that never prints an illegal/zero move
-// Every line is commented per your preference.
+/*
+ * Chinese Checkers Engine
+ */
 
-#define _POSIX_C_SOURCE 200809L                // Use POSIX for timers/handlers.
-#include <stdio.h>                             // stdin/stdout, fprintf.
-#include <stdlib.h>                            // exit helpers.
-#include <unistd.h>                            // getpid.
-#include <signal.h>                            // sigaction, sig* APIs.
-#include <setjmp.h>                            // sigsetjmp/siglongjmp.
-#include <string.h>                            // memset, strlen, strchr.
-#include <stdarg.h>                            // variadic logging.
-#include <sys/time.h>                          // setitimer.
-#include <time.h> 
-#include "ccheck.h"                            // assignment-provided API.
-#include "debug.h"                             // print_stats etc.
+/*
+ * To implement this module, remove the following #if 0 and the matching #endif.
+ * Fill in your implementation of the engine() function below (you may also add
+ * other functions).  When you compile the program, your implementation will be
+ * incorporated.  If you leave the #if 0 here, then your program will be linked
+ * with a demonstration version of the engine.  You can use this feature to work
+ * on your implementation of the main program before you attempt to implement
+ * the engine.
+ */
 
-extern int verbose, avgtime, depth, times[];   // Provided globals.
-extern Move principal_var[];                   // Provided principal variation.
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <string.h>
+#include <errno.h>
 
-static volatile sig_atomic_t g_hup = 0;        // SIGHUP flag from parent.
-static volatile sig_atomic_t g_alarm = 0;      // SIGALRM budget expiration.
-static volatile sig_atomic_t g_interrupted = 0;// We requested early stop.
-static volatile sig_atomic_t g_in_search = 0;  // We are inside bestmove().
-static sigjmp_buf g_jmp;                       // Jump target for interrupts.
+#include "ccheck.h"
+#include "debug.h"
 
-/* ---------- Logging ---------- */
-static void elog(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static void elog(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fprintf(stderr, "[engine] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    fflush(stderr);
-    va_end(ap);
-}
+/* Global variables (declared in ccheck.h, defined elsewhere) */
+extern int verbose;
+extern int randomized;
+extern int depth;
+extern int avgtime;
+extern Move principal_var[];
+extern int times[];
+extern int searchtime;
+extern int movetime;
+extern int xtime;
+extern int otime;
 
-/* ---------- Signals ---------- */
-static void on_sighup(int s){
-    (void)s;
-    g_hup = 1;
-    elog("SIGHUP received (in_search=%d)", g_in_search);
-    if (g_in_search) {                         // If searching, break out fast.
-        g_interrupted = 1;
-        elog("SIGHUP interrupting search, jumping...");
-        siglongjmp(g_jmp, 1);
-    }
-}
+/* Signal handling */
+static volatile sig_atomic_t sighup_received = 0;
+static volatile sig_atomic_t sigalrm_received = 0;
+static sigjmp_buf search_jmpbuf;
+static int search_jmpbuf_valid = 0;
 
-static void on_sigalrm(int s){
-    (void)s;
-    g_alarm = 1;
-    elog("SIGALRM received (in_search=%d)", g_in_search);
-    if (g_in_search) {                         // If searching, break out fast.
-        g_interrupted = 1;
-        elog("SIGALRM interrupting search, jumping...");
-        siglongjmp(g_jmp, 1);
-    }
-}
-
-/* ---------- Small utils ---------- */
-static void arm_timer_seconds(int secs){
-    struct itimerval it = {0};
-    if (secs > 0) it.it_value.tv_sec = secs;   // One-shot wall timer.
-    setitimer(ITIMER_REAL, &it, NULL);
-    elog("Timer armed for %d sec(s)", secs);
-}
-
-static int read_line(char *buf, size_t cap){
-    return fgets(buf, cap, stdin) != NULL;     // 1 on success, 0 on EOF.
-}
-
-static void chomp(char *s){
-    size_t n = strlen(s);
-    if (n && s[n-1] == '\n') s[n-1] = 0;       // Drop trailing newline.
-}
-
-static Move parse_move_text(Board *bp, const char *text){
-    elog("Parsing move text: '%s'", text);
-    FILE *mem = fmemopen((void*)text, strlen(text), "r");  // No copy, read-only.
-    if (!mem) return 0;
-    Move m = read_move_from_pipe(mem, bp);     // Will abort if text is ill-formed
-    fclose(mem);
-    return m;
-}
-
-static void send_ack(void){
-    fputs("ok\n", stdout);                     // Acknowledge opponent move.
-    fflush(stdout);
-    elog("Sent ack -> parent");
-}
-
-/* ---------- Core search helpers ---------- */
-static void think_until_interrupted(Board *bp){
-    elog("think_until_interrupted() starting");
-    g_interrupted = 0;
-
-    if (sigsetjmp(g_jmp, 1) != 0) {            // Resume point after interrupts.
-        elog("think_until_interrupted(): jumped (interrupted)");
-        g_in_search = 0;
-        return;
-    }
-
-    for (depth = 1; depth <= MAXPLY; depth++) {
-        if (g_hup || g_alarm || g_interrupted) // Respect stop signals quickly.
-            break;
-
-        g_in_search = 1;                       // Mark "in search" for handlers.
-        elog("Depth %d: calling bestmove()", depth);
-        bestmove(bp, player_to_move(bp), 0, principal_var, -MAXEVAL, MAXEVAL);
-        g_in_search = 0;
-
-        timings(depth);                        // Update timing model.
-        elog("Depth %d done", depth);
-
-        if (verbose) {                         // Optional debug printing.
-            print_stats();
-            print_pvar(bp, 0);
-            fprintf(stderr, "\n");
-            fflush(stderr);
+/* Signal handler */
+static void engine_signal_handler(int sig)
+{
+    if (sig == SIGHUP) {
+        sighup_received = 1;
+        if (search_jmpbuf_valid) {
+            siglongjmp(search_jmpbuf, 1);
+        }
+    } else if (sig == SIGALRM) {
+        sigalrm_received = 1;
+        if (search_jmpbuf_valid) {
+            siglongjmp(search_jmpbuf, 1);
         }
     }
-    elog("think_until_interrupted() complete");
 }
 
-/* Ensure principal_var[0] is **non-zero and legal** for bp. */
-static int ensure_legal_best_move(Board *bp){
-    // If PV already looks good, validate legality.
-    if (principal_var[0] && legal_move(principal_var[0], bp))
-        return 1;
-
-    elog("PV empty/illegal, computing fallback PV @ depth=1");
-    int saved = depth;                         // Save global depth.
-    depth = 1;                                 // Minimal search to get *some* move.
-    g_interrupted = 0;
-
-    if (sigsetjmp(g_jmp, 1) == 0) {            // Fresh, short search.
-        g_in_search = 1;
-        bestmove(bp, player_to_move(bp), 0, principal_var, -MAXEVAL, MAXEVAL);
-        g_in_search = 0;
-        timings(depth);
-    } else {
-        g_in_search = 0;                       // Interrupted during fallback.
-    }
-
-    depth = saved;                             // Restore depth limit.
-
-    // Final check: must be non-zero and legal.
-    if (principal_var[0] && legal_move(principal_var[0], bp)) {
-        elog("Fallback produced a legal move");
-        return 1;
-    }
-
-    // Give up cleanly (don’t abort inside print_move/read_move).
-    elog("No legal move available for current position -> resigning");
-    return 0;
-}
-
-/* Print the chosen move **atomically** wrt signals so we don't jump mid-print. */
-static int send_best_move_safely(Board *bp) {
-    if (!ensure_legal_best_move(bp)) return 0;
-
-    sigset_t block, prev;
-    sigemptyset(&block);
-    sigaddset(&block, SIGHUP);
-    sigaddset(&block, SIGALRM);
-    sigprocmask(SIG_BLOCK, &block, &prev);
-
-    char mvbuf[128];
-    FILE *mem = fmemopen(mvbuf, sizeof(mvbuf), "w");
-    print_move(bp, principal_var[0], mem);
-    fflush(mem);
-    fclose(mem);
-
-    const char *out = mvbuf;
-    if (!strncmp(out, "white:", 6)) out += 6;
-    else if (!strncmp(out, "black:", 6)) out += 6;
-    while (*out == ' ') out++;
-
-    // >>> KEY CHANGE: write directly to STDOUT (pipe), no stdio buffering
-    dprintf(STDOUT_FILENO, "%s\n", out);
-
-    elog("Best move sent (A1-B2 style chain)");
-    sigprocmask(SIG_SETMASK, &prev, NULL);
-    return 1;
-}
-
-/* Apply a '>side:move' line to our internal board and ack. */
-static int handle_opponent_line(Board *bp, const char *line) {
-    // Expect input like ">white:A3-C3-C5" or ">black:F8-F6"
-    elog("handle_opponent_line: received '%s'", line);
-
-    // 1️⃣ Find the ':' separator
-    const char *colon = strchr(line, ':');
-    if (!colon) {
-        elog("malformed opponent line (missing ':')");
-        return 0;
-    }
-
-    // 2️⃣ Extract the move text (everything after ':')
-    const char *mv_text = colon + 1;
-    while (*mv_text == ' ') mv_text++;  // skip accidental spaces
-
-    // 3️⃣ Parse the move using read_move_from_pipe()’s companion function
-    // We use a memory stream to reuse the same parser the referee uses.
-    FILE *mem = fmemopen((void *)mv_text, strlen(mv_text), "r");
-    if (!mem) {
-        elog("fmemopen failed for move parsing");
-        return 0;
-    }
-
-    Move m = read_move_from_pipe(mem, bp);
-    fclose(mem);
-
-    if (!m) {
-        elog("failed to parse opponent move '%s'", mv_text);
-        return 0;
-    }
-
-    // 4️⃣ Validate and apply move locally
-    if (!legal_move(m, bp)) {
-        elog("opponent move '%s' illegal on our board", mv_text);
-        return 0;
-    }
-
-    apply(bp, m);
-    elog("applied opponent move successfully: %s", mv_text);
-
-    // 5️⃣ Acknowledge success to parent (important for sync)
-    fputs("ok\n", stdout);
-    fflush(stdout);
-    elog("sent ack -> parent");
-
-    // Optional: clear interrupt flags to resume thinking cleanly
-    g_interrupted = 0;
-    g_hup = 0;
-    g_alarm = 0;
-
-    return 1;
-}
-
-/* ---------- Main engine loops ---------- */
-static void engine_main(Board *bp){
-    elog("Engine starting up (pid=%d)", getpid());
-
-    // Install handlers (SA_RESTART keeps stdio happy across signals).
-    struct sigaction sa = { .sa_flags = SA_RESTART, .sa_handler = on_sighup };
+/* Setup signal handlers */
+static void setup_engine_signals(void)
+{
+    struct sigaction sa;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGHUP, &sa, NULL);
+    sa.sa_handler = engine_signal_handler;
+    sa.sa_flags = 0;
 
-    struct sigaction sb = { .sa_flags = SA_RESTART, .sa_handler = on_sigalrm };
-    sigemptyset(&sb.sa_mask);
-    sigaction(SIGALRM, &sb, NULL);
-
-    setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered stdout to parent
-    setvbuf(stderr, NULL, _IOLBF, 0);   // readable logs
-
-    // Clear PV so we never read uninitialized garbage.
-    for (int i = 0; i < MAXPLY; i++) principal_var[i] = 0;
-
-    // Disarm timer initially.
-    arm_timer_seconds(0);
-
-    elog("Entering main loop");
-    while (1) {
-        // Reset flags
-        g_alarm = 0;
-        g_interrupted = 0;
-
-        // 1️⃣ Wait for commands (SIGHUP signals) — parent will always send one
-        if (!g_hup) {
-            // Just idle until a HUP arrives (no speculative search yet)
-            pause();
-            continue;
-        }
-
-        // 2️⃣ We got a HUP — clear it and read a line
-        g_hup = 0;
-
-        char line[512];
-        if (!read_line(line, sizeof(line))) {
-            elog("stdin EOF -> exiting");
-            _exit(0);
-        }
-        chomp(line);
-        elog("Received line: '%s'", line);
-
-        // 3️⃣ Handle commands
-        if (line[0] == '<') {
-            // Engine’s own turn — think and output a move
-            int budget = (avgtime > 0) ? avgtime : 1;
-            arm_timer_seconds(budget);
-
-            elog("Thinking for up to %d sec(s)", budget);
-            think_until_interrupted(bp);
-            arm_timer_seconds(0);
-
-            if (!send_best_move_safely(bp))
-                _exit(4);
-
-            // Apply the move locally to keep bp synced
-            if (principal_var[0]) {
-                apply(bp, principal_var[0]);
-                elog("Applied our own move (sync ok)");
-            }
-
-        } else if (line[0] == '>') {
-            // Opponent move forwarded — keep board in sync
-            if (!handle_opponent_line(bp, line)) {
-                elog("Invalid opponent line -> exit(2)");
-                _exit(2);
-            }
-            elog("Opponent move processed, board now synced");
-
-        } else {
-            elog("Unknown command '%s' -> exit(3)", line);
-            _exit(3);
-        }
+    if (sigaction(SIGHUP, &sa, NULL) < 0) {
+        perror("sigaction SIGHUP");
+        abort();
+    }
+    if (sigaction(SIGALRM, &sa, NULL) < 0) {
+        perror("sigaction SIGALRM");
+        abort();
     }
 }
 
-void my_engine(Board *bp) { engine_main(bp); }
+void engine(Board *bp)
+{
+    fprintf(stderr, "DEBUG: Engine: engine() function called, bp=%p\n", (void*)bp);
+    if (bp == NULL) {
+        fprintf(stderr, "DEBUG: Engine: ERROR - board pointer is NULL!\n");
+        abort();
+    }
+    fprintf(stderr, "DEBUG: Engine: initial board state - move_number=%d, player_to_move=%d\n",
+            move_number(bp), player_to_move(bp));
+    setup_engine_signals();
+    fprintf(stderr, "DEBUG: Engine: signal handlers set up\n");
+
+    setbuf(stdin, NULL);
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    /* Create a working copy of the board for searching */
+    Board *search_bp = newbd();
+    copybd(bp, search_bp);
+    fprintf(stderr, "DEBUG: Engine: created working board copy for searching\n");
+
+    int current_depth = 1;
+    int best_depth = 0;
+    int searching_on_opponent_time = 0;
+    int first_wait = 1;  /* Flag to check stdin on first wait */
+
+    fprintf(stderr, "DEBUG: Engine: entering main loop\n");
+    while (1) {
+        /* Wait for SIGHUP to read command from main process */
+        if (!sighup_received) {
+            fprintf(stderr, "DEBUG: Engine: no SIGHUP, searching_on_opponent_time=%d, best_depth=%d\n",
+                    searching_on_opponent_time, best_depth);
+            /* While waiting, search on opponent's time if we're not at max depth */
+            if (searching_on_opponent_time && best_depth < MAXPLY) {
+                for (depth = current_depth; depth <= MAXPLY; depth++) {
+                    if (sighup_received) {
+                        break; /* Interrupted by SIGHUP */
+                    }
+
+                    search_jmpbuf_valid = 1;
+                    if (sigsetjmp(search_jmpbuf, 1) != 0) {
+                        /* Jumped here from signal handler */
+                        search_jmpbuf_valid = 0;
+                        break;
+                    }
+
+                    reset_stats();
+                    {
+                        time_t t;
+                        time(&t);
+                        searchtime = (int)t;
+                    }
+
+                    if (verbose) {
+                        fprintf(stderr, "Searching depth %d...", depth);
+                        fflush(stderr);
+                    }
+
+                    /* Restore working board to current state before each search */
+                    copybd(bp, search_bp);
+                    int score = bestmove(search_bp, player_to_move(search_bp), 0, principal_var, -MAXEVAL, MAXEVAL);
+
+                    search_jmpbuf_valid = 0;
+
+                    timings(depth);
+
+                    if (verbose) {
+                        print_stats();
+                        print_pvar(bp, 0);
+                        fprintf(stderr, "\n");
+                    }
+
+                    best_depth = depth;
+
+                    /* Don't continue if position is won or lost */
+                    if (score == -(MAXEVAL-1) || score == MAXEVAL-1) {
+                        break;
+                    }
+
+                    if (sighup_received) {
+                        break;
+                    }
+                }
+            } else {
+                /* On first wait, check if data is already available (handles race condition) */
+                if (first_wait) {
+                    first_wait = 0;
+                    fd_set readfds;
+                    struct timeval timeout;
+                    FD_ZERO(&readfds);
+                    FD_SET(STDIN_FILENO, &readfds);
+                    timeout.tv_sec = 0;
+                    timeout.tv_usec = 0; /* Don't wait, just check */
+                    
+                    int ready = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout);
+                    if (ready > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
+                        if (!feof(stdin)) {
+                            fprintf(stderr, "DEBUG: Engine: data available in stdin on first wait, treating as SIGHUP\n");
+                            sighup_received = 1;
+                            continue; /* Go process the command */
+                        }
+                    }
+                }
+                /* Wait for SIGHUP - the main process will send it when it wants to communicate */
+                pause();
+            }
+        }
+
+        if (sighup_received) {
+            fprintf(stderr, "DEBUG: Engine: SIGHUP received, reading command\n");
+            sighup_received = 0;
+            searching_on_opponent_time = 0;
+
+            char cmd[256];
+            if (fgets(cmd, sizeof(cmd), stdin) == NULL) {
+                if (feof(stdin)) {
+                    fprintf(stderr, "DEBUG: Engine: EOF on stdin (pipe closed), exiting\n");
+                } else if (ferror(stdin)) {
+                    fprintf(stderr, "DEBUG: Engine: Error reading from stdin, exiting\n");
+                } else {
+                    fprintf(stderr, "DEBUG: Engine: fgets returned NULL, exiting\n");
+                }
+                break; /* EOF or error */
+            }
+
+            fprintf(stderr, "DEBUG: Engine: received command: '%s' (first char: '%c')\n", cmd, cmd[0]);
+
+            if (cmd[0] == '<') {
+                fprintf(stderr, "DEBUG: Engine: Main process wants a move - it's our turn\n");
+                /* Main process wants a move - it's our turn */
+                /* Search with time constraints if needed */
+                struct itimerval timer;
+                int time_limit = 0;
+
+                /* Calculate available time */
+                if (avgtime > 0) {
+                    int moves_made = move_number(bp);
+                    Player current_player = player_to_move(bp);
+                    int total_time_used = (current_player == X) ? xtime : otime;
+                    int time_remaining = (avgtime * (moves_made + 1)) - total_time_used;
+                    if (time_remaining > 0) {
+                        time_limit = time_remaining;
+                    }
+                }
+
+                /* Set up alarm if we have a time limit */
+                if (time_limit > 0) {
+                    timer.it_value.tv_sec = time_limit;
+                    timer.it_value.tv_usec = 0;
+                    timer.it_interval.tv_sec = 0;
+                    timer.it_interval.tv_usec = 0;
+                    setitimer(ITIMER_REAL, &timer, NULL);
+                    sigalrm_received = 0;
+                }
+
+                /* Search iteratively deepening with time constraint */
+                /* Always search to at least depth 1 */
+                if (current_depth > 1 && best_depth == 0) {
+                    current_depth = 1;
+                }
+                
+                fprintf(stderr, "DEBUG: Engine: Starting search, current_depth=%d, best_depth=%d\n", current_depth, best_depth);
+                
+                for (depth = current_depth; depth <= MAXPLY; depth++) {
+                    fprintf(stderr, "DEBUG: Engine: Searching at depth %d\n", depth);
+                    if (sighup_received) {
+                        fprintf(stderr, "DEBUG: Engine: SIGHUP received during search loop, breaking\n");
+                        break;
+                    }
+
+                    /* Check if we have time for this depth */
+                    if (avgtime > 0 && depth > 1 && times[depth] > 0) {
+                        int moves_made = move_number(bp);
+                        Player current_player = player_to_move(bp);
+                        int total_time_used = (current_player == X) ? xtime : otime;
+                        int time_remaining = (avgtime * (moves_made + 1)) - total_time_used;
+                        if (time_remaining < times[depth]) {
+                            fprintf(stderr, "DEBUG: Engine: Not enough time for depth %d, breaking\n", depth);
+                            break; /* Not enough time */
+                        }
+                    }
+
+                    search_jmpbuf_valid = 1;
+                    if (sigsetjmp(search_jmpbuf, 1) != 0) {
+                        /* Jumped here from signal handler */
+                        fprintf(stderr, "DEBUG: Engine: Jumped from signal handler\n");
+                        search_jmpbuf_valid = 0;
+                        break;
+                    }
+
+                    reset_stats();
+                    {
+                        time_t t;
+                        time(&t);
+                        searchtime = (int)t;
+                    }
+
+                    fprintf(stderr, "DEBUG: Engine: Calling bestmove at depth %d\n", depth);
+                    if (verbose) {
+                        fprintf(stderr, "Searching depth %d...", depth);
+                        fflush(stderr);
+                    }
+
+                    /* Restore working board to current state before each search */
+                    copybd(bp, search_bp);
+                    fprintf(stderr, "DEBUG: Engine: before bestmove - move_number=%d (main), %d (search), player_to_move=%d\n",
+                            move_number(bp), move_number(search_bp), player_to_move(bp));
+                    int score = bestmove(search_bp, player_to_move(search_bp), 0, principal_var, -MAXEVAL, MAXEVAL);
+                    fprintf(stderr, "DEBUG: Engine: after bestmove - move_number=%d (main), %d (search), player_to_move=%d\n",
+                            move_number(bp), move_number(search_bp), player_to_move(bp));
+
+                    fprintf(stderr, "DEBUG: Engine: bestmove returned, score=%d\n", score);
+                    search_jmpbuf_valid = 0;
+
+                    timings(depth);
+
+                    if (verbose) {
+                        print_stats();
+                        print_pvar(bp, 0);
+                        fprintf(stderr, "\n");
+                    }
+
+                    best_depth = depth;
+                    fprintf(stderr, "DEBUG: Engine: Search completed at depth %d, best_depth=%d\n", depth, best_depth);
+
+                    /* Don't continue if position is won or lost */
+                    if (score == -(MAXEVAL-1) || score == MAXEVAL-1) {
+                        fprintf(stderr, "DEBUG: Engine: Position is won/lost, breaking\n");
+                        break;
+                    }
+
+                    if (sighup_received || sigalrm_received) {
+                        fprintf(stderr, "DEBUG: Engine: Signal received, breaking\n");
+                        break;
+                    }
+                }
+                
+                fprintf(stderr, "DEBUG: Engine: Search loop finished, best_depth=%d\n", best_depth);
+
+                /* Cancel alarm */
+                if (time_limit > 0) {
+                    timer.it_value.tv_sec = 0;
+                    timer.it_value.tv_usec = 0;
+                    timer.it_interval.tv_sec = 0;
+                    timer.it_interval.tv_usec = 0;
+                    setitimer(ITIMER_REAL, &timer, NULL);
+                }
+
+                /* Send best move if we have one */
+                fprintf(stderr, "DEBUG: Engine: best_depth=%d after search\n", best_depth);
+                if (best_depth >= 1) {
+                    Move m = principal_var[0];
+                    fprintf(stderr, "DEBUG: Engine: sending move to main process, move=0x%x\n", m);
+                    fprintf(stderr, "DEBUG: Engine: current board state - move_number=%d, player_to_move=%d\n",
+                            move_number(bp), player_to_move(bp));
+                    fprintf(stderr, "DEBUG: Engine: checking if move is legal: %d\n", legal_move(m, bp));
+                    /* Print move BEFORE applying it (print_move needs pre-move board state) */
+                    print_move(bp, m, stdout);
+                    printf("\n");
+                    fflush(stdout);
+                    fprintf(stderr, "DEBUG: Engine: move printed to stdout, flushed\n");
+
+                    /* Apply move to our board AFTER printing */
+                    apply(bp, m);
+                    setclock(player_to_move(bp) == X ? O : X);
+                    /* Update search board copy */
+                    copybd(bp, search_bp);
+                    fprintf(stderr, "DEBUG: Engine: move applied to board\n");
+
+                    /* Reset search depth */
+                    current_depth = 1;
+                    best_depth = 0;
+                    fprintf(stderr, "DEBUG: Engine: move sent and applied to board, resetting state\n");
+                    fprintf(stderr, "DEBUG: Engine: going back to wait loop\n");
+                } else {
+                    /* This shouldn't happen, but if it does, search to depth 1 */
+                    fprintf(stderr, "Warning: No move ready, forcing depth 1 search\n");
+                    depth = 1;
+                    reset_stats();
+                    {
+                        time_t t;
+                        time(&t);
+                        searchtime = (int)t;
+                    }
+                    bestmove(bp, player_to_move(bp), 0, principal_var, -MAXEVAL, MAXEVAL);
+                    timings(1);
+                    best_depth = 1;
+                    
+                    Move m = principal_var[0];
+                    print_move(bp, m, stdout);
+                    printf("\n");
+                    fflush(stdout);
+                    apply(bp, m);
+                    setclock(player_to_move(bp) == X ? O : X);
+                    current_depth = 1;
+                    best_depth = 0;
+                }
+            } else if (cmd[0] == '>') {
+                fprintf(stderr, "DEBUG: Engine: Main process sending opponent's move\n");
+                /* Main process sending opponent's move */
+                /* Read the move */
+                char *move_str = cmd + 1;
+                FILE *tmp = fmemopen(move_str, strlen(move_str), "r");
+                if (tmp) {
+                    Move m = read_move_from_pipe(tmp, bp);
+                    fclose(tmp);
+
+                    fprintf(stderr, "DEBUG: Engine: read opponent move: 0x%x\n", m);
+                    if (m != 0) {
+                        fprintf(stderr, "DEBUG: Engine: before applying opponent move - move_number=%d, player_to_move=%d\n",
+                                move_number(bp), player_to_move(bp));
+                        /* Apply move to board */
+                        apply(bp, m);
+                        setclock(player_to_move(bp) == X ? O : X);
+                        /* Update search board copy */
+                        copybd(bp, search_bp);
+                        fprintf(stderr, "DEBUG: Engine: after applying opponent move - move_number=%d, player_to_move=%d\n",
+                                move_number(bp), player_to_move(bp));
+
+                        /* If this matches our principal variation, keep it */
+                        if (best_depth >= 1 && principal_var[0] == m && best_depth > 1) {
+                            fprintf(stderr, "DEBUG: Engine: opponent move matches PV, keeping it\n");
+                            /* Shift principal variation */
+                            for (int i = 0; i < best_depth - 1; i++) {
+                                principal_var[i] = principal_var[i + 1];
+                            }
+                            current_depth = best_depth - 1;
+                            best_depth = current_depth;
+                        } else {
+                            fprintf(stderr, "DEBUG: Engine: opponent move doesn't match PV, resetting search\n");
+                            /* Reset search */
+                            current_depth = 1;
+                            best_depth = 0;
+                        }
+                    }
+                }
+
+                /* Send acknowledgement */
+                fprintf(stderr, "DEBUG: Engine: sending 'ok' acknowledgement\n");
+                printf("ok\n");
+                fflush(stdout);
+                
+                /* Now we can search on opponent's time */
+                searching_on_opponent_time = 1;
+                fprintf(stderr, "DEBUG: Engine: can now search on opponent's time\n");
+            } else {
+                fprintf(stderr, "DEBUG: Engine: unknown command: '%c'\n", cmd[0]);
+            }
+        }
+    }
+}

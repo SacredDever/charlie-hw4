@@ -19,7 +19,7 @@ ALL_FUNCF := $(filter-out $(MAIN) $(AUX), $(ALL_OBJF))
 
 INC := -I $(INCD)
 
-CFLAGS := -Wall -Werror -Wno-unused-function -MMD -D_DEFAULT_SOURCE
+CFLAGS := -Wall -Werror -Wno-unused-function -MMD -D_DEFAULT_SOURCE -D_GNU_SOURCE
 COLORF := -DCOLOR
 DFLAGS := -g -DDEBUG -DCOLOR
 PRINT_STAMENTS := -DERROR -DSUCCESS -DWARN -DINFO
@@ -45,7 +45,7 @@ $(BLDD):
 	mkdir -p $(BLDD)
 
 $(BIND)/$(EXEC): $(MAIN) $(ALL_FUNCF) $(LIBS)
-	$(CC) $(CFLAGS) $(INC) $^ -o $@
+	$(CC) $(CFLAGS) $(INC) -Wl,--allow-multiple-definition $(MAIN) $(ALL_FUNCF) $(LIBS) -o $@
 
 #$(BIND)/$(TEST_EXEC): $(ALL_FUNCF) $(TEST_SRC) $(LIBS)
 #	$(CC) $(CFLAGS) $(INC) $(ALL_FUNCF) $(TEST_SRC) $(TEST_LIB) $(LIBS) -o $@
