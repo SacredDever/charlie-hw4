@@ -10,6 +10,7 @@
 #include <string.h>                            // memset, strlen, strchr.
 #include <stdarg.h>                            // variadic logging.
 #include <sys/time.h>                          // setitimer.
+#include <time.h> 
 #include "ccheck.h"                            // assignment-provided API.
 #include "debug.h"                             // print_stats etc.
 
@@ -155,35 +156,85 @@ static int ensure_legal_best_move(Board *bp){
 }
 
 /* Print the chosen move **atomically** wrt signals so we don't jump mid-print. */
-static int send_best_move_safely(Board *bp){
-    if (!ensure_legal_best_move(bp))           // Make sure we've got a valid move.
-        return 0;
+static int send_best_move_safely(Board *bp) {
+    if (!ensure_legal_best_move(bp)) return 0;
 
-    sigset_t block, prev;                      // Block HUP/ALRM during print.
+    sigset_t block, prev;
     sigemptyset(&block);
     sigaddset(&block, SIGHUP);
     sigaddset(&block, SIGALRM);
     sigprocmask(SIG_BLOCK, &block, &prev);
 
-    elog("Best move about to print: %u", principal_var[0]);
-    print_move(bp, principal_var[0], stdout);  // Must not be called with illegal m.
-    fputc('\n', stdout);                       // Trailing newline is required.
-    fflush(stdout);
-    elog("Best move sent");
+    char mvbuf[128];
+    FILE *mem = fmemopen(mvbuf, sizeof(mvbuf), "w");
+    print_move(bp, principal_var[0], mem);
+    fflush(mem);
+    fclose(mem);
 
-    sigprocmask(SIG_SETMASK, &prev, NULL);     // Restore signal mask.
+    const char *out = mvbuf;
+    if (!strncmp(out, "white:", 6)) out += 6;
+    else if (!strncmp(out, "black:", 6)) out += 6;
+    while (*out == ' ') out++;
+
+    // >>> KEY CHANGE: write directly to STDOUT (pipe), no stdio buffering
+    dprintf(STDOUT_FILENO, "%s\n", out);
+
+    elog("Best move sent (A1-B2 style chain)");
+    sigprocmask(SIG_SETMASK, &prev, NULL);
     return 1;
 }
 
 /* Apply a '>side:move' line to our internal board and ack. */
-static int handle_opponent_line(Board *bp, const char *line){
-    const char *colon = strchr(line, ':');     // Split at first ':'.
-    if (!colon) return 0;
-    Move m = parse_move_text(bp, colon + 1);   // Parse (aborts on malformed).
-    if (!m || !legal_move(m, bp)) return 0;    // Safety: must be legal for bp.
-    apply(bp, m);                              // Update our board state.
-    send_ack();                                // Tell parent we've applied it.
-    elog("Applied opponent move successfully");
+static int handle_opponent_line(Board *bp, const char *line) {
+    // Expect input like ">white:A3-C3-C5" or ">black:F8-F6"
+    elog("handle_opponent_line: received '%s'", line);
+
+    // 1️⃣ Find the ':' separator
+    const char *colon = strchr(line, ':');
+    if (!colon) {
+        elog("malformed opponent line (missing ':')");
+        return 0;
+    }
+
+    // 2️⃣ Extract the move text (everything after ':')
+    const char *mv_text = colon + 1;
+    while (*mv_text == ' ') mv_text++;  // skip accidental spaces
+
+    // 3️⃣ Parse the move using read_move_from_pipe()’s companion function
+    // We use a memory stream to reuse the same parser the referee uses.
+    FILE *mem = fmemopen((void *)mv_text, strlen(mv_text), "r");
+    if (!mem) {
+        elog("fmemopen failed for move parsing");
+        return 0;
+    }
+
+    Move m = read_move_from_pipe(mem, bp);
+    fclose(mem);
+
+    if (!m) {
+        elog("failed to parse opponent move '%s'", mv_text);
+        return 0;
+    }
+
+    // 4️⃣ Validate and apply move locally
+    if (!legal_move(m, bp)) {
+        elog("opponent move '%s' illegal on our board", mv_text);
+        return 0;
+    }
+
+    apply(bp, m);
+    elog("applied opponent move successfully: %s", mv_text);
+
+    // 5️⃣ Acknowledge success to parent (important for sync)
+    fputs("ok\n", stdout);
+    fflush(stdout);
+    elog("sent ack -> parent");
+
+    // Optional: clear interrupt flags to resume thinking cleanly
+    g_interrupted = 0;
+    g_hup = 0;
+    g_alarm = 0;
+
     return 1;
 }
 
@@ -200,8 +251,8 @@ static void engine_main(Board *bp){
     sigemptyset(&sb.sa_mask);
     sigaction(SIGALRM, &sb, NULL);
 
-    // Make stdout line-buffered so the parent always sees lines promptly.
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered stdout to parent
+    setvbuf(stderr, NULL, _IOLBF, 0);   // readable logs
 
     // Clear PV so we never read uninitialized garbage.
     for (int i = 0; i < MAXPLY; i++) principal_var[i] = 0;
@@ -209,23 +260,23 @@ static void engine_main(Board *bp){
     // Disarm timer initially.
     arm_timer_seconds(0);
 
-    // Command buffer from parent.
-    char line[512];
-
     elog("Entering main loop");
     while (1) {
-        // Reset per-iteration flags (avoid sticky state).
+        // Reset flags
         g_alarm = 0;
         g_interrupted = 0;
 
-        // Idle-search if no command yet; this pre-warms PV for the next '<'.
+        // 1️⃣ Wait for commands (SIGHUP signals) — parent will always send one
         if (!g_hup) {
-            think_until_interrupted(bp);
+            // Just idle until a HUP arrives (no speculative search yet)
+            pause();
             continue;
         }
 
-        // We have a command pending; clear the flag and read the line.
+        // 2️⃣ We got a HUP — clear it and read a line
         g_hup = 0;
+
+        char line[512];
         if (!read_line(line, sizeof(line))) {
             elog("stdin EOF -> exiting");
             _exit(0);
@@ -233,31 +284,34 @@ static void engine_main(Board *bp){
         chomp(line);
         elog("Received line: '%s'", line);
 
-        if (line[0] == '<') {                  // Parent requests our move.
+        // 3️⃣ Handle commands
+        if (line[0] == '<') {
+            // Engine’s own turn — think and output a move
             int budget = (avgtime > 0) ? avgtime : 1;
-            arm_timer_seconds(budget);         // Budget thinking time.
+            arm_timer_seconds(budget);
+
             elog("Thinking for up to %d sec(s)", budget);
-            think_until_interrupted(bp);       // Deepen PV as time allows.
-            arm_timer_seconds(0);              // Stop timer before printing.
+            think_until_interrupted(bp);
+            arm_timer_seconds(0);
 
-            if (!send_best_move_safely(bp))    // Print move; never illegal/zero.
-                _exit(4);                      // Clean failure: no legal move.
+            if (!send_best_move_safely(bp))
+                _exit(4);
 
-            if (principal_var[0]) {            // Keep our internal board in sync.
+            // Apply the move locally to keep bp synced
+            if (principal_var[0]) {
                 apply(bp, principal_var[0]);
-                elog("Applied our own move");
+                elog("Applied our own move (sync ok)");
             }
 
-        } else if (line[0] == '>') {           // Parent forwards opponent move.
+        } else if (line[0] == '>') {
+            // Opponent move forwarded — keep board in sync
             if (!handle_opponent_line(bp, line)) {
                 elog("Invalid opponent line -> exit(2)");
                 _exit(2);
             }
-            // After applying opponent move, keep thinking opportunistically.
-            g_interrupted = 0;
-            think_until_interrupted(bp);
+            elog("Opponent move processed, board now synced");
 
-        } else {                               // Unknown protocol line.
+        } else {
             elog("Unknown command '%s' -> exit(3)", line);
             _exit(3);
         }
