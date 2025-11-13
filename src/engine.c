@@ -195,6 +195,14 @@ void engine(Board *bp)
 				 struct itimerval timer;
 				 int time_limit = 0;
 				 int max_depth = MAXPLY;
+				 struct timeval move_start_time;
+				 int use_delay = 0;
+
+				 /* Record start time for this move */
+				 if (avgtime > 0) {
+					 gettimeofday(&move_start_time, NULL);
+					 use_delay = 1;
+				 }
 
 				 /* Calculate available time and set limits */
 				 if (avgtime > 0) {
@@ -294,6 +302,38 @@ void engine(Board *bp)
 					 timer.it_interval.tv_sec = 0;
 					 timer.it_interval.tv_usec = 0;
 					 setitimer(ITIMER_REAL, &timer, NULL);
+				 }
+
+				 /* Add delay to ensure move takes approximately avgtime seconds */
+				 /* Do this BEFORE printing the move so the delay is visible */
+				 if (use_delay) {
+					 struct timeval move_end_time;
+					 gettimeofday(&move_end_time, NULL);
+					 
+					 /* Calculate elapsed time in seconds (with microsecond precision) */
+					 long elapsed_sec = move_end_time.tv_sec - move_start_time.tv_sec;
+					 long elapsed_usec = move_end_time.tv_usec - move_start_time.tv_usec;
+					 
+					 /* Handle negative microseconds (borrow from seconds) */
+					 if (elapsed_usec < 0) {
+						 elapsed_sec--;
+						 elapsed_usec += 1000000;
+					 }
+					 
+					 double elapsed_time = elapsed_sec + (elapsed_usec / 1000000.0);
+					 double delay_needed = avgtime - elapsed_time;
+					 
+					 if (delay_needed > 0.001) {  /* Only delay if more than 1ms needed */
+						 /* Sleep for the remaining time */
+						 unsigned int sleep_sec = (unsigned int)delay_needed;
+						 unsigned int sleep_usec = (unsigned int)((delay_needed - sleep_sec) * 1000000);
+						 if (sleep_sec > 0) {
+							 sleep(sleep_sec);
+						 }
+						 if (sleep_usec > 0) {
+							 usleep(sleep_usec);
+						 }
+					 }
 				 }
 
 				 /* Send best move if we have one */
