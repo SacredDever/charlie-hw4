@@ -9,6 +9,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 #include "ccheck.h"
 #include "debug.h"
@@ -305,10 +306,16 @@ static int send_move_to_engine(Board *bp, Move m)
 {
     if (!engine_out) return -1;
 
+    /* Create a copy of the board for print_move (it needs pre-move state) */
+    Board *temp_bp = newbd();
+    copybd(bp, temp_bp);
+
     fprintf(engine_out, ">");
-    print_move(bp, m, engine_out);
+    print_move(temp_bp, m, engine_out);
     fprintf(engine_out, "\n");
     fflush(engine_out);
+
+    /* Note: We can't easily free temp_bp, but it's just for printing */
 
     if (kill(engine_pid, SIGHUP) < 0) {
         perror("kill engine SIGHUP");
@@ -416,7 +423,14 @@ static int read_game_history(Board *bp, const char *filename)
         /* Write to transcript if in use */
         if (transcript_file) {
             Player p = (player_to_move(bp) == X) ? O : X;
-            fprintf(transcript_file, "%d. %s:", move_number(bp), p == X ? "white" : "black");
+            int move_num = move_number(bp);
+            if (p == X) {
+                /* White move: format is "N. white:MOVE" */
+                fprintf(transcript_file, "%d. white:", move_num);
+            } else {
+                /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
+                fprintf(transcript_file, "%d. ... black:", move_num - 1);
+            }
             print_move(bp, m, transcript_file);
             fprintf(transcript_file, "\n");
             fflush(transcript_file);
@@ -454,6 +468,7 @@ int ccheck(int argc, char *argv[])
                 break;
             case 'r':
                 randomized = 1;
+                srand(time(NULL));  /* Seed random number generator for randomization */
                 break;
             case 'v':
                 verbose = 1;
@@ -612,11 +627,18 @@ int ccheck(int argc, char *argv[])
             /* Send move to engine if it's playing */
             if ((play_white && current_player == O) || (play_black && current_player == X)) {
                 fprintf(stderr, "DEBUG: Sending user move to engine\n");
-                send_move_to_engine(bp, m);
+                if (send_move_to_engine(bp, m) < 0) {
+                    fprintf(stderr, "Failed to send move to engine\n");
+                    break;
+                }
             }
         }
 
         fprintf(stderr, "DEBUG: Applying move to board\n");
+        
+        /* Save move number and player before applying move (for transcript) */
+        int move_num_before = move_number(bp);
+        Player move_player = current_player;
         
         /* Update display BEFORE applying move (print_move needs pre-move board state) */
         /* Only update display for computer moves - user moves from display already know about it */
@@ -634,20 +656,26 @@ int ccheck(int argc, char *argv[])
             fprintf(stderr, "DEBUG: Skipping display update for user move (display already knows)\n");
         }
         
+        /* Write to transcript BEFORE applying move (print_move needs pre-move board state) */
+        if (transcript_file) {
+            if (move_player == X) {
+                /* White move: format is "N. white:MOVE" where N is move number after applying */
+                fprintf(transcript_file, "%d. white:", move_num_before + 1);
+            } else {
+                /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
+                fprintf(transcript_file, "%d. ... black:", move_num_before);
+            }
+            print_move(bp, m, transcript_file);
+            fprintf(transcript_file, "\n");
+            fflush(transcript_file);
+        }
+        
         /* Apply move to board */
         apply(bp, m);
         setclock(current_player);
 
         if (!use_display) {
             print_bd(bp, stdout);
-        }
-
-        /* Write to transcript */
-        if (transcript_file) {
-            fprintf(transcript_file, "%d. %s:", move_number(bp), current_player == X ? "white" : "black");
-            print_move(bp, m, transcript_file);
-            fprintf(transcript_file, "\n");
-            fflush(transcript_file);
         }
     }
 
