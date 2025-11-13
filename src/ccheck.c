@@ -424,6 +424,34 @@ static int read_game_history(Board *bp, const char *filename)
         if (transcript_file) {
             Player p = (player_to_move(bp) == X) ? O : X;
             int move_num = move_number(bp);
+            
+            /* Capture what print_move outputs and strip player prefix if present */
+            char move_buffer[256] = {0};
+            FILE *capture_stream = fmemopen(move_buffer, sizeof(move_buffer) - 1, "w");
+            if (capture_stream) {
+                print_move(bp, m, capture_stream);
+                fclose(capture_stream);
+            } else {
+                /* Fallback: write directly if fmemopen fails */
+                if (p == X) {
+                    fprintf(transcript_file, "%d. white:", move_num);
+                } else {
+                    fprintf(transcript_file, "%d. ... black:", move_num - 1);
+                }
+                print_move(bp, m, transcript_file);
+                fprintf(transcript_file, "\n");
+                fflush(transcript_file);
+                continue;
+            }
+
+            /* Strip player prefix (e.g., "black:" or "white:") if present */
+            char *move_str = move_buffer;
+            char *colon = strchr(move_buffer, ':');
+            if (colon && (strncmp(move_buffer, "black:", 6) == 0 || strncmp(move_buffer, "white:", 6) == 0)) {
+                move_str = colon + 1;  /* Skip past the colon */
+            }
+
+            /* Write formatted move to transcript */
             if (p == X) {
                 /* White move: format is "N. white:MOVE" */
                 fprintf(transcript_file, "%d. white:", move_num);
@@ -431,7 +459,7 @@ static int read_game_history(Board *bp, const char *filename)
                 /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
                 fprintf(transcript_file, "%d. ... black:", move_num - 1);
             }
-            print_move(bp, m, transcript_file);
+            fprintf(transcript_file, "%s", move_str);  /* Write only the move notation, not the player prefix */
             fprintf(transcript_file, "\n");
             fflush(transcript_file);
         }
@@ -641,23 +669,53 @@ int ccheck(int argc, char *argv[])
         Player move_player = current_player;
         
         /* Update display BEFORE applying move (print_move needs pre-move board state) */
-        /* Only update display for computer moves - user moves from display already know about it */
-        if (use_display && display_out && is_computer_turn) {
-            fprintf(stderr, "DEBUG: Updating display with computer move (before applying)\n");
-            /* Create a copy of the board for print_move (it needs pre-move state) */
-            Board *temp_bp = newbd();
-            copybd(bp, temp_bp);
-            if (send_move_to_display(temp_bp, m) < 0) {
-                fprintf(stderr, "DEBUG: Failed to update display, but continuing\n");
-                /* Continue even if display update fails */
+        /* In tournament mode, update display for both computer and user moves (user moves come from stdin, not display) */
+        /* In non-tournament mode, only update display for computer moves (user moves from display already know about it) */
+        if (use_display && display_out) {
+            if (is_computer_turn || tournament_mode) {
+                fprintf(stderr, "DEBUG: Updating display with move (before applying)\n");
+                /* Create a copy of the board for print_move (it needs pre-move board state) */
+                Board *temp_bp = newbd();
+                copybd(bp, temp_bp);
+                if (send_move_to_display(temp_bp, m) < 0) {
+                    fprintf(stderr, "DEBUG: Failed to update display, but continuing\n");
+                    /* Continue even if display update fails */
+                }
+                /* Note: We can't easily free temp_bp, but it's just for printing */
+            } else {
+                fprintf(stderr, "DEBUG: Skipping display update for user move (display already knows)\n");
             }
-            /* Note: We can't easily free temp_bp, but it's just for printing */
-        } else if (use_display && !is_computer_turn) {
-            fprintf(stderr, "DEBUG: Skipping display update for user move (display already knows)\n");
         }
         
         /* Write to transcript BEFORE applying move (print_move needs pre-move board state) */
         if (transcript_file) {
+            /* Capture what print_move outputs and strip player prefix if present */
+            char move_buffer[256] = {0};
+            FILE *capture_stream = fmemopen(move_buffer, sizeof(move_buffer) - 1, "w");
+            if (capture_stream) {
+                print_move(bp, m, capture_stream);
+                fclose(capture_stream);
+            } else {
+                /* Fallback: write directly if fmemopen fails */
+                if (move_player == X) {
+                    fprintf(transcript_file, "%d. white:", move_num_before + 1);
+                } else {
+                    fprintf(transcript_file, "%d. ... black:", move_num_before);
+                }
+                print_move(bp, m, transcript_file);
+                fprintf(transcript_file, "\n");
+                fflush(transcript_file);
+                goto skip_transcript_write;
+            }
+
+            /* Strip player prefix (e.g., "black:" or "white:") if present */
+            char *move_str = move_buffer;
+            char *colon = strchr(move_buffer, ':');
+            if (colon && (strncmp(move_buffer, "black:", 6) == 0 || strncmp(move_buffer, "white:", 6) == 0)) {
+                move_str = colon + 1;  /* Skip past the colon */
+            }
+
+            /* Write formatted move to transcript */
             if (move_player == X) {
                 /* White move: format is "N. white:MOVE" where N is move number after applying */
                 fprintf(transcript_file, "%d. white:", move_num_before + 1);
@@ -665,10 +723,11 @@ int ccheck(int argc, char *argv[])
                 /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
                 fprintf(transcript_file, "%d. ... black:", move_num_before);
             }
-            print_move(bp, m, transcript_file);
+            fprintf(transcript_file, "%s", move_str);  /* Write only the move notation, not the player prefix */
             fprintf(transcript_file, "\n");
             fflush(transcript_file);
         }
+        skip_transcript_write:;
         
         /* Apply move to board */
         apply(bp, m);
