@@ -378,6 +378,7 @@ static Move get_move_from_engine(Board *bp)
 /* Read game history from file */
 static int read_game_history(Board *bp, const char *filename)
 {
+    fprintf(stderr, "Initializing game from file %s\n", filename);
     FILE *f = fopen(filename, "r");
     if (!f) {
         perror("fopen history file");
@@ -385,87 +386,160 @@ static int read_game_history(Board *bp, const char *filename)
     }
 
     char line[256];
+    int move_count = 0;
     while (fgets(line, sizeof(line), f)) {
         /* Skip empty lines */
-        if (line[0] == '\n' || line[0] == '\0') continue;
+        if (line[0] == '\n' || line[0] == '\0') {
+            fprintf(stderr, "DEBUG: read_game_history: skipping empty line\n");
+            continue;
+        }
 
         /* Parse line format: "N. white:MOVE" or "N. ... black:MOVE" */
         char *colon = strchr(line, ':');
-        if (!colon) continue;
+        if (!colon) {
+            fprintf(stderr, "DEBUG: read_game_history: skipping line without colon: %s", line);
+            continue;
+        }
 
+        /* Determine which player this move is for based on the line format */
+        /* Format is either "N. white:MOVE" or "N. ... black:MOVE" */
+        Player move_player;
+        if (strstr(line, "white:")) {
+            move_player = X;  /* X is white */
+        } else if (strstr(line, "black:")) {
+            move_player = O;  /* O is black */
+        } else {
+            fprintf(stderr, "DEBUG: read_game_history: cannot determine player from line: %s", line);
+            continue;
+        }
+        
         /* Extract move part (after colon) */
         char *move_str = colon + 1;
-        /* Remove newline if present */
+        move_count++;
+        fprintf(stderr, "DEBUG: read_game_history: processing move %d, raw line: %s", move_count, line);
+        
+        /* Remove newline and carriage return if present */
         char *newline = strchr(move_str, '\n');
         if (newline) *newline = '\0';
+        char *carriage = strchr(move_str, '\r');
+        if (carriage) *carriage = '\0';
+        
+        /* Trim leading whitespace */
+        while (*move_str == ' ' || *move_str == '\t') {
+            move_str++;
+        }
+        
+        /* Trim trailing whitespace */
+        char *end = move_str + strlen(move_str) - 1;
+        while (end > move_str && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+            *end = '\0';
+            end--;
+        }
+        
+        /* Skip empty moves */
+        if (*move_str == '\0') {
+            fprintf(stderr, "DEBUG: read_game_history: skipping empty move string\n");
+            continue;
+        }
+
+        /* Verify it's the correct player's turn */
+        Player current_player = player_to_move(bp);
+        if (current_player != move_player) {
+            fprintf(stderr, "DEBUG: read_game_history: wrong player - expected %d, got %d for move '%s'\n", 
+                    current_player, move_player, move_str);
+            /* This might be okay if the file format is inconsistent, but log it */
+        }
 
         /* Create a temporary file-like stream for the move */
-        FILE *tmp = fmemopen(move_str, strlen(move_str), "r");
+        /* read_move_from_pipe expects a newline-terminated move, so we need to add one */
+        /* Format should match what print_move outputs: "white:MOVE" or "black:MOVE" */
+        char move_with_prefix[256];
+        if (move_player == X) {
+            snprintf(move_with_prefix, sizeof(move_with_prefix), "white:%s\n", move_str);
+        } else {
+            snprintf(move_with_prefix, sizeof(move_with_prefix), "black:%s\n", move_str);
+        }
+        
+        FILE *tmp = fmemopen(move_with_prefix, strlen(move_with_prefix), "r");
         if (!tmp) {
             perror("fmemopen");
             fclose(f);
             return -1;
         }
 
+        fprintf(stderr, "DEBUG: read_game_history: calling read_move_from_pipe with move '%s' (board state: move_num=%d, player=%d)\n", 
+                move_with_prefix, move_number(bp), player_to_move(bp));
         Move m = read_move_from_pipe(tmp, bp);
         fclose(tmp);
 
-        if (m == 0) break;
+        if (m == 0) {
+            /* EOF or invalid move - stop reading */
+            fprintf(stderr, "DEBUG: read_game_history: read_move_from_pipe returned 0 for move %d: '%s'\n", move_count, move_str);
+            break;
+        }
+        
+        fprintf(stderr, "DEBUG: read_game_history: successfully parsed move %d: '%s' -> 0x%x\n", move_count, move_str, m);
+
+        /* Verify move is legal before proceeding */
+        if (!legal_move(m, bp)) {
+            fprintf(stderr, "Warning: Illegal move in history file: %s\n", move_str);
+            break;
+        }
+
+        /* Determine player and move number BEFORE applying move */
+        Player p = player_to_move(bp);
+        int move_num_before = move_number(bp);
+
+        /* Capture print_move output BEFORE applying move (print_move needs pre-move board state) */
+        char move_buffer[256] = {0};
+        FILE *capture_stream = fmemopen(move_buffer, sizeof(move_buffer) - 1, "w");
+        if (capture_stream) {
+            print_move(bp, m, capture_stream);
+            fclose(capture_stream);
+        }
+
+        /* Strip player prefix (e.g., "black:" or "white:") if present */
+        char *move_str_for_display = move_buffer;
+        char *move_colon = strchr(move_buffer, ':');
+        if (move_colon && (strncmp(move_buffer, "black:", 6) == 0 || strncmp(move_buffer, "white:", 6) == 0)) {
+            move_str_for_display = move_colon + 1;  /* Skip past the colon */
+        }
+
+        /* Update display BEFORE applying move (print_move needs pre-move board state) */
+        if (use_display && display_out) {
+            /* Create a copy of the board for print_move (it needs pre-move state) */
+            Board *temp_bp = newbd();
+            copybd(bp, temp_bp);
+            if (send_move_to_display(temp_bp, m) < 0) {
+                fprintf(stderr, "Warning: Failed to update display with move %d, continuing anyway\n", move_count);
+            }
+            /* Note: We can't easily free temp_bp, but it's just for printing */
+        }
 
         apply(bp, m);
         setclock(player_to_move(bp) == X ? O : X);
 
-        /* Update display if in use */
-        if (use_display && display_out) {
-            send_move_to_display(bp, m);
-        }
-
         /* Write to transcript if in use */
-        if (transcript_file) {
-            Player p = (player_to_move(bp) == X) ? O : X;
-            int move_num = move_number(bp);
-            
-            /* Capture what print_move outputs and strip player prefix if present */
-            char move_buffer[256] = {0};
-            FILE *capture_stream = fmemopen(move_buffer, sizeof(move_buffer) - 1, "w");
-            if (capture_stream) {
-                print_move(bp, m, capture_stream);
-                fclose(capture_stream);
-            } else {
-                /* Fallback: write directly if fmemopen fails */
-                if (p == X) {
-                    fprintf(transcript_file, "%d. white:", move_num);
-                } else {
-                    fprintf(transcript_file, "%d. ... black:", move_num - 1);
-                }
-                print_move(bp, m, transcript_file);
-                fprintf(transcript_file, "\n");
-                fflush(transcript_file);
-                continue;
-            }
-
-            /* Strip player prefix (e.g., "black:" or "white:") if present */
-            char *move_str = move_buffer;
-            char *colon = strchr(move_buffer, ':');
-            if (colon && (strncmp(move_buffer, "black:", 6) == 0 || strncmp(move_buffer, "white:", 6) == 0)) {
-                move_str = colon + 1;  /* Skip past the colon */
-            }
-
+        if (transcript_file && move_str_for_display) {
             /* Write formatted move to transcript */
+            /* Move numbers: move_number increments after each move, so we need to calculate the move pair number */
+            /* For both white and black moves in the same pair, we use: (move_num_before / 2) + 1 */
+            int transcript_move_num = (move_num_before / 2) + 1;
             if (p == X) {
                 /* White move: format is "N. white:MOVE" */
-                fprintf(transcript_file, "%d. white:", move_num);
+                fprintf(transcript_file, "%d. white:", transcript_move_num);
             } else {
                 /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
-                fprintf(transcript_file, "%d. ... black:", move_num - 1);
+                fprintf(transcript_file, "%d. ... black:", transcript_move_num);
             }
-            fprintf(transcript_file, "%s", move_str);  /* Write only the move notation, not the player prefix */
+            fprintf(transcript_file, "%s", move_str_for_display);  /* Write only the move notation, not the player prefix */
             fprintf(transcript_file, "\n");
             fflush(transcript_file);
         }
     }
 
     fclose(f);
+    fprintf(stderr, "DEBUG: read_game_history: read %d moves total\n", move_count);
     return 0;
 }
 
@@ -554,12 +628,14 @@ int ccheck(int argc, char *argv[])
 
     /* Read game history if specified */
     if (init_file) {
+        fprintf(stderr, "DEBUG: Reading game history from %s\n", init_file);
         if (read_game_history(bp, init_file) < 0) {
             fprintf(stderr, "Failed to read game history\n");
             cleanup_children();
             if (transcript_file) fclose(transcript_file);
             return EXIT_FAILURE;
         }
+        fprintf(stderr, "DEBUG: Finished reading game history\n");
     }
 
     /* Start engine process if needed */
@@ -697,10 +773,11 @@ int ccheck(int argc, char *argv[])
                 fclose(capture_stream);
             } else {
                 /* Fallback: write directly if fmemopen fails */
+                int transcript_move_num = (move_num_before / 2) + 1;
                 if (move_player == X) {
-                    fprintf(transcript_file, "%d. white:", move_num_before + 1);
+                    fprintf(transcript_file, "%d. white:", transcript_move_num);
                 } else {
-                    fprintf(transcript_file, "%d. ... black:", move_num_before);
+                    fprintf(transcript_file, "%d. ... black:", transcript_move_num);
                 }
                 print_move(bp, m, transcript_file);
                 fprintf(transcript_file, "\n");
@@ -716,12 +793,15 @@ int ccheck(int argc, char *argv[])
             }
 
             /* Write formatted move to transcript */
+            /* Move numbers: move_number increments after each move, so we need to calculate the move pair number */
+            /* For both white and black moves in the same pair, we use: (move_num_before / 2) + 1 */
+            int transcript_move_num = (move_num_before / 2) + 1;
             if (move_player == X) {
-                /* White move: format is "N. white:MOVE" where N is move number after applying */
-                fprintf(transcript_file, "%d. white:", move_num_before + 1);
+                /* White move: format is "N. white:MOVE" */
+                fprintf(transcript_file, "%d. white:", transcript_move_num);
             } else {
                 /* Black move: format is "N. ... black:MOVE" where N is same as white's move number */
-                fprintf(transcript_file, "%d. ... black:", move_num_before);
+                fprintf(transcript_file, "%d. ... black:", transcript_move_num);
             }
             fprintf(transcript_file, "%s", move_str);  /* Write only the move notation, not the player prefix */
             fprintf(transcript_file, "\n");
