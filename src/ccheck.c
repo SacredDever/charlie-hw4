@@ -543,6 +543,9 @@ static int read_game_history(Board *bp, const char *filename)
     return 0;
 }
 
+/* Global variable definition - verbose is not defined in the library */
+int verbose;
+
 int ccheck(int argc, char *argv[])
 {
     int opt;

@@ -26,24 +26,24 @@
  #include "ccheck.h"
  #include "debug.h"
  
- /* Global variables (declared in ccheck.h, defined elsewhere) */
- extern int verbose;
- extern int randomized;
- extern int depth;
- extern int avgtime;
- extern Move principal_var[];
- extern int times[];
- extern int searchtime;
- extern int movetime;
- extern int xtime;
- extern int otime;
- 
- /* Signal handling */
- static volatile sig_atomic_t sighup_received = 0;
- static volatile sig_atomic_t sigalrm_received = 0;
- static sigjmp_buf search_jmpbuf;
- static int search_jmpbuf_valid = 0;
- 
+/* Global variables (declared in ccheck.h, defined elsewhere) */
+extern int verbose;
+extern int randomized;
+extern int depth;
+extern int avgtime;
+extern Move principal_var[];
+extern int times[];
+extern int searchtime;
+extern int movetime;
+extern int xtime;
+extern int otime;
+
+/* Signal handling */
+static volatile sig_atomic_t sighup_received = 0;
+static volatile sig_atomic_t sigalrm_received = 0;
+static sigjmp_buf search_jmpbuf;
+static int search_jmpbuf_valid = 0;
+
  /* Signal handler */
  static void engine_signal_handler(int sig)
  {
